@@ -12,10 +12,15 @@ enum TrailEvent: Sendable {
 
 @MainActor
 final class TrailOverlayController: NSObject {
-    private let overlayWindow: NSWindow
-    private let canvasView: TrailCanvasView
+    private struct ScreenOverlay {
+        let window: NSWindow
+        let canvasView: TrailCanvasView
+    }
+
+    private var overlays: [ScreenOverlay] = []
     private var simulator = TrailSimulator()
     private var displayLink: CADisplayLink?
+    private weak var displayLinkView: TrailCanvasView?
     private var isEnabled: Bool = true
     private var style: TrailStyle = .neonCyan
     private var screenObserver: NSObjectProtocol?
@@ -23,36 +28,9 @@ final class TrailOverlayController: NSObject {
     init(isEnabled: Bool, style: TrailStyle) {
         self.isEnabled = isEnabled
         self.style = style
-
-        let initialFrame = Self.combinedScreenFrame()
-        let window = NSWindow(
-            contentRect: initialFrame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.level = .screenSaver
-        window.collectionBehavior = [
-            .canJoinAllSpaces,
-            .fullScreenAuxiliary,
-            .stationary,
-            .ignoresCycle
-        ]
-        window.isReleasedWhenClosed = false
-
-        let view = TrailCanvasView(frame: NSRect(origin: .zero, size: initialFrame.size))
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.clear.cgColor
-        view.layer?.drawsAsynchronously = true
-        window.contentView = view
-
-        self.overlayWindow = window
-        self.canvasView = view
         super.init()
+
+        syncOverlayWindowsToScreens()
 
         self.screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -60,7 +38,7 @@ final class TrailOverlayController: NSObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.updateWindowFrameToMatchScreens()
+                self?.syncOverlayWindowsToScreens()
             }
         }
     }
@@ -74,7 +52,9 @@ final class TrailOverlayController: NSObject {
     func updateConfiguration(isEnabled: Bool, style: TrailStyle) {
         self.isEnabled = isEnabled
         self.style = style
-        canvasView.style = style
+        for overlay in overlays {
+            overlay.canvasView.style = style
+        }
 
         if !isEnabled {
             clearAndHide()
@@ -88,10 +68,10 @@ final class TrailOverlayController: NSObject {
 
         switch event {
         case .begin(let quartzPoint, _):
-            updateWindowFrameToMatchScreens()
+            syncOverlayWindowsToScreens()
             let cocoaPoint = Self.quartzToCocoa(quartzPoint)
             simulator.beginStroke(at: cocoaPoint, now: now)
-            ensureAnimating()
+            ensureAnimating(for: cocoaPoint)
 
         case .move(let quartzPoint, let rawDeltaX, let rawDeltaY, let lockCursor, let enableVertical):
             let cocoaPoint = Self.quartzToCocoa(quartzPoint)
@@ -105,12 +85,12 @@ final class TrailOverlayController: NSObject {
                 screenBounds: activeScreenBounds,
                 now: now
             )
-            ensureAnimating()
+            ensureAnimating(for: simulator.headPosition ?? cocoaPoint)
 
         case .end:
             simulator.endStroke()
             if simulator.hasVisibleContent {
-                ensureAnimating()
+                ensureAnimating(for: simulator.headPosition)
             } else {
                 stopAndHide()
             }
@@ -122,24 +102,37 @@ final class TrailOverlayController: NSObject {
         stopAndHide()
     }
 
-    private func ensureAnimating() {
-        if !overlayWindow.isVisible {
-            overlayWindow.orderFrontRegardless()
+    private func ensureAnimating(for cocoaPoint: CGPoint? = nil) {
+        if overlays.isEmpty {
+            syncOverlayWindowsToScreens()
+        }
+        guard !overlays.isEmpty else { return }
+
+        for overlay in overlays where !overlay.window.isVisible {
+            overlay.window.orderFrontRegardless()
         }
 
-        if displayLink == nil {
-            let link = canvasView.displayLink(target: self, selector: #selector(onDisplayLink(_:)))
+        let targetOverlay = cocoaPoint.flatMap { point in
+            overlays.first { $0.window.frame.contains(point) }
+        } ?? overlays[0]
+
+        if displayLink == nil || displayLinkView !== targetOverlay.canvasView {
+            displayLink?.invalidate()
+            let link = targetOverlay.canvasView.displayLink(target: self, selector: #selector(onDisplayLink(_:)))
             link.add(to: .main, forMode: .common)
             displayLink = link
+            displayLinkView = targetOverlay.canvasView
         }
         displayLink?.isPaused = false
     }
 
     private func stopAndHide() {
         displayLink?.isPaused = true
-        canvasView.clear()
-        if overlayWindow.isVisible {
-            overlayWindow.orderOut(nil)
+        for overlay in overlays {
+            overlay.canvasView.clear()
+            if overlay.window.isVisible {
+                overlay.window.orderOut(nil)
+            }
         }
     }
 
@@ -154,24 +147,82 @@ final class TrailOverlayController: NSObject {
     }
 
     private func pushRenderState(now: TimeInterval) {
-        canvasView.update(
-            points: simulator.points,
-            particles: simulator.particles,
-            headPosition: simulator.isActive ? simulator.headPosition : nil,
-            headSpeed: simulator.headSpeed,
-            windowOrigin: overlayWindow.frame.origin,
-            pointLifetime: simulator.pointLifetime,
-            style: style,
-            now: now
-        )
+        let head = simulator.isActive ? simulator.headPosition : nil
+        for overlay in overlays {
+            overlay.canvasView.update(
+                points: simulator.points,
+                particles: simulator.particles,
+                headPosition: head,
+                headSpeed: simulator.headSpeed,
+                windowOrigin: overlay.window.frame.origin,
+                pointLifetime: simulator.pointLifetime,
+                style: style,
+                now: now
+            )
+        }
     }
 
-    private func updateWindowFrameToMatchScreens() {
-        let unionFrame = Self.combinedScreenFrame()
-        if overlayWindow.frame != unionFrame {
-            overlayWindow.setFrame(unionFrame, display: false)
-            canvasView.frame = NSRect(origin: .zero, size: unionFrame.size)
+    private func syncOverlayWindowsToScreens() {
+        let targetFrames = Self.screenFrames()
+        let currentFrames = overlays.map(\.window.frame)
+        guard currentFrames != targetFrames else { return }
+
+        let wasVisible = overlays.contains { $0.window.isVisible }
+
+        displayLink?.invalidate()
+        displayLink = nil
+        displayLinkView = nil
+
+        for overlay in overlays {
+            overlay.canvasView.clear()
+            overlay.window.orderOut(nil)
+            overlay.window.close()
         }
+
+        overlays = targetFrames.map { makeOverlay(for: $0) }
+
+        if wasVisible && simulator.hasVisibleContent && isEnabled {
+            ensureAnimating(for: simulator.headPosition)
+        }
+    }
+
+    private func makeOverlay(for frame: NSRect) -> ScreenOverlay {
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.setFrame(frame, display: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.level = .screenSaver
+        window.collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .stationary,
+            .ignoresCycle
+        ]
+        window.isReleasedWhenClosed = false
+
+        let view = TrailCanvasView(frame: NSRect(origin: .zero, size: frame.size))
+        view.style = style
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        view.layer?.drawsAsynchronously = true
+        window.contentView = view
+
+        return ScreenOverlay(window: window, canvasView: view)
+    }
+
+    private static func screenFrames() -> [NSRect] {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else {
+            return [NSRect(x: 0, y: 0, width: 1440, height: 900)]
+        }
+        return screens.map(\.frame)
     }
 
     private static func combinedScreenFrame() -> NSRect {
@@ -227,7 +278,14 @@ private final class TrailCanvasView: NSView {
         self.style = style
         self.renderTime = now
 
-        let currentRect = computeContentBounds()
+        let rawCurrent = computeContentBounds()
+        let currentRect: NSRect
+        if rawCurrent.isNull {
+            currentRect = .null
+        } else {
+            let intersected = rawCurrent.intersection(bounds)
+            currentRect = intersected.isEmpty ? .null : intersected
+        }
         let unionRect: NSRect
         if previousDirtyRect.isNull {
             unionRect = currentRect
